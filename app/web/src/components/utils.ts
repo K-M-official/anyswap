@@ -1,9 +1,13 @@
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { Connection, PublicKey, Transaction, Keypair, SystemProgram } from '@solana/web3.js';
 import { 
-  createMint, 
-  mintTo, 
-  getOrCreateAssociatedTokenAccount,
-  TOKEN_PROGRAM_ID
+  TOKEN_PROGRAM_ID,
+  MINT_SIZE,
+  getMinimumBalanceForRentExemptMint,
+  createInitializeMintInstruction,
+  createMintToInstruction,
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+  getAccount,
 } from '@solana/spl-token';
 
 /**
@@ -26,29 +30,60 @@ export async function handleCreateToken(
     throw new Error('小数位数必须是 0-9 之间的数字');
   }
 
-  // 创建钱包适配器包装器
-  const walletAdapter = {
-    publicKey: publicKey,
-    signTransaction: signTransaction,
-  };
+  // 创建 mint 账户的 keypair
+  const mintKeypair = Keypair.generate();
+  const mint = mintKeypair.publicKey;
 
-  // 使用 SPL Token 标准库创建 mint
-  // createMint 内部会创建账户、发送交易并确认
-  const mint = await createMint(
-    connection,
-    walletAdapter as any, // payer (钱包适配器)
-    publicKey, // mint authority
-    null, // freeze authority (null = no freeze authority)
-    tokenDecimals // decimals
+  // 获取创建 mint 账户所需的最小租金
+  const lamports = await getMinimumBalanceForRentExemptMint(connection);
+
+  // 构建交易
+  const transaction = new Transaction();
+
+  // 1. 创建 mint 账户
+  transaction.add(
+    SystemProgram.createAccount({
+      fromPubkey: publicKey,
+      newAccountPubkey: mint,
+      space: MINT_SIZE,
+      lamports,
+      programId: TOKEN_PROGRAM_ID,
+    })
   );
 
-  // 注意：createMint 已经发送并确认了交易
-  // 我们可以通过查询最近的交易来获取签名，但这里简化处理
-  // 实际使用中，如果需要签名，可以在调用前手动构建交易
+  // 2. 初始化 mint
+  transaction.add(
+    createInitializeMintInstruction(
+      mint,
+      tokenDecimals,
+      publicKey, // mint authority
+      null // freeze authority (null = no freeze authority)
+    )
+  );
+
+  // 获取最新的 blockhash
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  transaction.recentBlockhash = blockhash;
+  transaction.feePayer = publicKey;
+
+  // 签名交易（需要签名 mint keypair 和用户钱包）
+  transaction.partialSign(mintKeypair);
+  const signedTransaction = await signTransaction(transaction);
+
+  // 发送并确认交易
+  const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
+    skipPreflight: false,
+  });
+
+  await connection.confirmTransaction({
+    signature,
+    blockhash,
+    lastValidBlockHeight,
+  }, 'confirmed');
   
   return {
     mint: mint,
-    signature: '', // createMint 内部已经发送交易，这里返回空字符串
+    signature: signature,
     name: tokenName,
     symbol: tokenSymbol,
     decimals: tokenDecimals,
@@ -73,37 +108,79 @@ export async function handleMintToken(
 
   const mint = new PublicKey(mintAddress);
   
-  // 获取或创建用户的关联代币账户
-  const userTokenAccount = await getOrCreateAssociatedTokenAccount(
-    connection,
-    { publicKey, signTransaction } as any, // payer
+  // 计算关联代币账户地址
+  const userTokenAccount = await getAssociatedTokenAddress(
     mint,
     publicKey, // owner
     false, // allowOwnerOffCurve
-    undefined, // commitment
-    undefined, // confirmOptions
     TOKEN_PROGRAM_ID
   );
+
+  // 检查账户是否存在
+  let accountExists = false;
+  try {
+    await getAccount(connection, userTokenAccount, 'confirmed', TOKEN_PROGRAM_ID);
+    accountExists = true;
+  } catch (error: any) {
+    // 账户不存在，需要在交易中创建
+    if (error.name === 'TokenAccountNotFoundError' || error.name === 'TokenInvalidAccountOwnerError') {
+      accountExists = false;
+    } else {
+      throw error;
+    }
+  }
 
   // 计算要铸造的数量（考虑小数位）
   const amountInSmallestUnit = BigInt(Math.floor(amount * Math.pow(10, decimals)));
 
-  // 使用 SPL Token 标准库铸造代币
-  const signature = await mintTo(
-    connection,
-    { publicKey, signTransaction } as any, // payer
-    mint,
-    userTokenAccount.address,
-    publicKey, // mint authority (用户自己)
-    amountInSmallestUnit, // amount
-    [], // multiSigners
-    undefined, // confirmOptions
-    TOKEN_PROGRAM_ID
+  // 构建交易
+  const transaction = new Transaction();
+  
+  // 如果账户不存在，先创建关联代币账户
+  if (!accountExists) {
+    transaction.add(
+      createAssociatedTokenAccountInstruction(
+        publicKey, // payer
+        userTokenAccount, // ata
+        publicKey, // owner
+        mint, // mint
+        TOKEN_PROGRAM_ID
+      )
+    );
+  }
+  
+  // 添加 mint 指令
+  transaction.add(
+    createMintToInstruction(
+      mint,
+      userTokenAccount,
+      publicKey, // mint authority
+      amountInSmallestUnit,
+      [], // multiSigners
+      TOKEN_PROGRAM_ID
+    )
   );
+
+  // 获取最新的 blockhash
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  transaction.recentBlockhash = blockhash;
+  transaction.feePayer = publicKey;
+
+  // 签名并发送交易
+  const signedTransaction = await signTransaction(transaction);
+  const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
+    skipPreflight: false,
+  });
+
+  await connection.confirmTransaction({
+    signature,
+    blockhash,
+    lastValidBlockHeight,
+  }, 'confirmed');
 
   return {
     signature: signature,
-    userTokenAccount: userTokenAccount.address.toString(),
+    userTokenAccount: userTokenAccount.toString(),
     amount: amountInSmallestUnit.toString(),
   };
 }

@@ -234,21 +234,34 @@ export default function UserActions({
         } else if (isFirstLiquidity) {
           // 首次添加：根据权重比例计算
           // amount_i = baseAmount * (weight_i / weight_base)
-          const weightRatio = Number(tokenInfo.weight) / Number(baseTokenInfo.weight);
-          const calculatedAmount = baseAmountInSmallestUnit * BigInt(Math.floor(weightRatio * 10000)) / BigInt(10000);
+          // 使用整数运算避免精度损失
+          const weightBase = BigInt(baseTokenInfo.weight.toString());
+          const weightI = BigInt(tokenInfo.weight.toString());
+          // 使用更大的倍数来保持精度，然后向下取整
+          const calculatedAmount = (baseAmountInSmallestUnit * weightI) / weightBase;
           amountBN = new BN(calculatedAmount.toString());
         } else {
-          // 后续添加：根据权重和当前池余额比例计算
-          // amount_i = baseAmount * (weight_i / weight_base) * (vault_i / vault_base)
+          // 后续添加：根据当前池余额比例计算（与合约逻辑一致）
+          // amount_i = baseAmount * vault_balances[i] / base_vault_balance
+          // 合约使用整数运算：expected_deposit = base_amount * vault_balances[i] / base_vault_balance
           if (baseVaultBalance === BigInt(0)) {
             onStatusChange('基准币的 Vault 余额为 0，无法计算其他币的数量');
             onLoadingChange(false);
             return;
           }
-          const weightRatio = Number(tokenInfo.weight) / Number(baseTokenInfo.weight);
-          const vaultRatio = Number(vaultBalances[i]) / Number(baseVaultBalance);
-          const calculatedAmount = baseAmountInSmallestUnit * BigInt(Math.floor(weightRatio * vaultRatio * 10000)) / BigInt(10000);
-          amountBN = new BN(calculatedAmount.toString());
+          if (vaultBalances[i] === BigInt(0)) {
+            onStatusChange(`Token ${i + 1} 的 Vault 余额为 0，无法添加流动性`);
+            onLoadingChange(false);
+            return;
+          }
+          // 使用整数运算，与合约完全一致
+          // 合约计算：expected_deposit = (base_amount * vault_balances[i]) / base_vault_balance
+          // 为了确保通过合约检查（expected_deposit <= amounts[i]），我们计算精确值
+          // 由于整数除法向下取整，我们计算的值应该等于或略大于合约期望的值
+          const calculatedAmount = (baseAmountInSmallestUnit * vaultBalances[i]) / baseVaultBalance;
+          // 添加 1 的最小单位作为安全余量，确保通过检查（处理整数除法的舍入误差）
+          const safeAmount = calculatedAmount + BigInt(1);
+          amountBN = new BN(safeAmount.toString());
         }
 
         amounts.push(amountBN);
@@ -268,6 +281,41 @@ export default function UserActions({
         onStatusChange('已取消添加流动性');
         onLoadingChange(false);
         return;
+      }
+
+      // 检查用户账户余额是否足够
+      onStatusChange('正在检查账户余额...');
+      for (let i = 0; i < tokens.length; i++) {
+        try {
+          const userAccount = await token.getAccount(connection, userTokenAccounts[i]);
+          const requiredAmount = amounts[i];
+          const userBalance = new BN(userAccount.amount.toString());
+          
+          if (userBalance.lt(requiredAmount)) {
+            const decimals = mintDecimals[i];
+            const requiredReadable = (Number(requiredAmount.toString()) / Math.pow(10, decimals)).toFixed(decimals);
+            const balanceReadable = (Number(userBalance.toString()) / Math.pow(10, decimals)).toFixed(decimals);
+            onStatusChange(
+              `Token ${i + 1} 余额不足！\n` +
+              `需要: ${requiredReadable}\n` +
+              `当前余额: ${balanceReadable}\n` +
+              `Mint: ${tokens[i].mintAccount.toString()}`
+            );
+            onLoadingChange(false);
+            return;
+          }
+        } catch (error: any) {
+          const decimals = mintDecimals[i];
+          const requiredReadable = (Number(amounts[i].toString()) / Math.pow(10, decimals)).toFixed(decimals);
+          onStatusChange(
+            `无法获取 Token ${i + 1} 账户信息！\n` +
+            `需要: ${requiredReadable}\n` +
+            `Mint: ${tokens[i].mintAccount.toString()}\n` +
+            `错误: ${error.message}`
+          );
+          onLoadingChange(false);
+          return;
+        }
       }
 
       onStatusChange('正在添加流动性...');
@@ -384,6 +432,133 @@ export default function UserActions({
     }
   };
 
+  const handleRemoveLiquidity = async () => {
+    if (!client || !publicKey || !poolAddress || !connection || !signTransaction || !program) {
+      onStatusChange('请先连接钱包并输入 Pool 地址');
+      return;
+    }
+
+    onLoadingChange(true);
+    onStatusChange('正在获取 Pool 信息...');
+
+    try {
+      const { BN } = await import('@coral-xyz/anchor');
+      const pool = new PublicKey(poolAddress);
+      const poolMint = client.getPoolMint(pool);
+      const poolAccount = await client.getPoolInfo(pool);
+      const tokens = poolAccount.tokens;
+
+      if (tokens.length === 0) {
+        onStatusChange('Pool 中还没有 Token');
+        onLoadingChange(false);
+        return;
+      }
+
+      // 获取用户的 LP token 账户
+      const userPoolAta = await token.getAssociatedTokenAddress(poolMint, publicKey);
+      let userLpBalance = BigInt(0);
+      try {
+        const lpAccount = await token.getAccount(connection, userPoolAta);
+        userLpBalance = BigInt(lpAccount.amount.toString());
+      } catch {
+        onStatusChange('您没有 LP token，无法移除流动性');
+        onLoadingChange(false);
+        return;
+      }
+
+      if (userLpBalance === BigInt(0)) {
+        onStatusChange('您的 LP token 余额为 0，无法移除流动性');
+        onLoadingChange(false);
+        return;
+      }
+
+      // 获取 LP mint 信息以显示可读格式
+      const lpMintInfo = await token.getMint(connection, poolMint);
+      const lpDecimals = lpMintInfo.decimals;
+      const lpBalanceReadable = (Number(userLpBalance.toString()) / Math.pow(10, lpDecimals)).toFixed(lpDecimals);
+
+      // 让用户输入要销毁的 LP token 数量
+      const burnAmountInput = prompt(
+        `您的 LP token 余额: ${lpBalanceReadable}\n` +
+        `小数位数: ${lpDecimals}\n\n` +
+        `请输入要销毁的 LP token 数量:`,
+        lpBalanceReadable
+      );
+
+      if (burnAmountInput === null) {
+        onStatusChange('已取消移除流动性');
+        onLoadingChange(false);
+        return;
+      }
+
+      const burnAmountFloat = parseFloat(burnAmountInput.trim());
+      if (isNaN(burnAmountFloat) || burnAmountFloat <= 0) {
+        onStatusChange('请输入有效的正数数量');
+        onLoadingChange(false);
+        return;
+      }
+
+      // 转换为最小计量单位
+      const burnAmountInSmallestUnit = BigInt(Math.floor(burnAmountFloat * Math.pow(10, lpDecimals)));
+      if (burnAmountInSmallestUnit > userLpBalance) {
+        onStatusChange(`销毁数量不能超过您的 LP token 余额: ${lpBalanceReadable}`);
+        onLoadingChange(false);
+        return;
+      }
+
+      const burnAmountBN = new BN(burnAmountInSmallestUnit.toString());
+
+      // 准备用户 token 账户和 vault 账户
+      const userTokenAccounts: PublicKey[] = [];
+      const vaultAccounts: PublicKey[] = [];
+
+      for (const tokenInfo of tokens) {
+        const userTokenAccountAddress = await token.getAssociatedTokenAddress(
+          tokenInfo.mintAccount,
+          publicKey
+        );
+
+        // 检查账户是否存在，如果不存在则创建
+        try {
+          await token.getAccount(connection, userTokenAccountAddress);
+        } catch {
+          const createIx = token.createAssociatedTokenAccountInstruction(
+            publicKey,
+            userTokenAccountAddress,
+            publicKey,
+            tokenInfo.mintAccount
+          );
+          const { blockhash } = await connection.getLatestBlockhash('confirmed');
+          const tx = new Transaction().add(createIx);
+          tx.recentBlockhash = blockhash;
+          tx.feePayer = publicKey;
+          const signedTx = await signTransaction(tx);
+          const signature = await connection.sendRawTransaction(signedTx.serialize());
+          await connection.confirmTransaction(signature, 'confirmed');
+        }
+
+        userTokenAccounts.push(userTokenAccountAddress);
+        vaultAccounts.push(tokenInfo.vaultAccount);
+      }
+
+      onStatusChange('正在移除流动性...');
+
+      const signature = await client.removeLiquidity(
+        pool,
+        burnAmountBN,
+        userTokenAccounts,
+        vaultAccounts,
+      );
+
+      onStatusChange(`流动性移除成功！交易签名: ${signature}`);
+    } catch (error: any) {
+      onStatusChange(`移除流动性失败: ${error.message}`);
+      console.error('移除流动性错误:', error);
+    } finally {
+      onLoadingChange(false);
+    }
+  };
+
   return (
     <div>
       <h2>普通用户操作</h2>
@@ -401,6 +576,13 @@ export default function UserActions({
           className="action-button"
         >
           添加流动性
+        </button>
+        <button
+          onClick={handleRemoveLiquidity}
+          disabled={loading || !publicKey || !client}
+          className="action-button"
+        >
+          移除流动性
         </button>
         <button
           onClick={handleSwap}

@@ -1,8 +1,8 @@
-import { PublicKey, Transaction } from '@solana/web3.js';
-import { AdminClient } from '@anyswap/client';
+import { PublicKey } from '@solana/web3.js';
+import { Client } from '@anyswap/client';
 
 interface AdminActionsProps {
-  adminClient: AdminClient | null;
+  client: Client | null;
   publicKey: PublicKey | null;
   poolAddress: string;
   loading: boolean;
@@ -12,7 +12,7 @@ interface AdminActionsProps {
 }
 
 export default function AdminActions({
-  adminClient,
+  client,
   publicKey,
   poolAddress,
   loading,
@@ -21,7 +21,7 @@ export default function AdminActions({
   onPoolCreated,
 }: AdminActionsProps) {
   const handleCreatePool = async () => {
-    if (!adminClient || !publicKey) {
+    if (!client || !publicKey) {
       onStatusChange('请先连接钱包');
       return;
     }
@@ -37,10 +37,10 @@ export default function AdminActions({
 
     try {
       const { BN } = await import('@coral-xyz/anchor');
-      const result = await adminClient.createPool(
-        new BN(poolIdNum),
-        new BN(5), // fee numerator: 5
-        new BN(1000) // fee denominator: 1000 (0.5%)
+      const result = await client.createPool(
+        new BN(5),// fee numerator: 5
+        new BN(1000), // fee denominator: 1000 (0.5%)
+        publicKey
       );
 
       const poolAddr = result.pool.toString();
@@ -58,7 +58,7 @@ export default function AdminActions({
   };
 
   const handleAddToken = async () => {
-    if (!adminClient || !publicKey || !poolAddress) {
+    if (!client || !publicKey || !poolAddress) {
       onStatusChange('请先创建 Pool 或输入 Pool 地址');
       return;
     }
@@ -80,7 +80,7 @@ export default function AdminActions({
       const weightBN = new BN(parseInt(weight));
       const pool = new PublicKey(poolAddress);
 
-      const signature = await adminClient.addTokenToPool(
+      const signature = await client.addTokenToPool(
         pool,
         mint,
         weightBN
@@ -101,14 +101,14 @@ export default function AdminActions({
       <div className="button-group">
         <button
           onClick={handleCreatePool}
-          disabled={loading || !publicKey || !adminClient}
+          disabled={loading || !publicKey || !client}
           className="action-button primary"
         >
           创建 Pool
         </button>
         <button
           onClick={handleAddToken}
-          disabled={loading || !publicKey || !adminClient}
+          disabled={loading || !publicKey || !client}
           className="action-button primary"
         >
           添加 Token 到 Pool
